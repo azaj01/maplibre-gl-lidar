@@ -501,7 +501,9 @@ console.log(`Loaded ${data.pointCount} points`);
 
 ### Next.js
 
-When using maplibre-gl-lidar with Next.js, you need to configure webpack to handle Node.js built-in modules that are referenced (but not executed) in browser code. Add the following to your `next.config.js`:
+maplibre-gl-lidar works with Next.js out of the box, including Turbopack (the default bundler in Next.js 15+). The library bundles browser-safe shims for Node.js modules that are statically referenced but never executed in browsers.
+
+**Note for older Next.js versions or custom webpack configs:** If you encounter "Can't resolve 'fs'" errors, add this to your `next.config.js`:
 
 ```javascript
 /** @type {import('next').NextConfig} */
@@ -520,8 +522,6 @@ const nextConfig = {
 
 module.exports = nextConfig;
 ```
-
-This configuration tells webpack not to bundle the `fs` and `path` modules for client-side code. These modules are only referenced in environment-guarded code paths that never execute in browsers.
 
 ## Coordinate Systems
 
