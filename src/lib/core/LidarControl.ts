@@ -16,6 +16,7 @@ import type {
 } from './types';
 import type { PickedPointInfo } from '../layers/types';
 import type { StreamingLoaderOptions, ViewportInfo, StreamingProgressEvent } from '../loaders/streaming-types';
+import type { PointCloudData } from '../loaders/types';
 import { DeckOverlay } from './DeckOverlay';
 import { PointCloudLoader } from '../loaders/PointCloudLoader';
 import { CopcStreamingLoader } from '../loaders/CopcStreamingLoader';
@@ -508,6 +509,106 @@ export class LidarControl implements IControl {
    */
   getDeckOverlay(): DeckOverlay | undefined {
     return this._deckOverlay;
+  }
+
+  // ==================== Point editing API ====================
+
+  /**
+   * Gets the live point data of a loaded cloud, for tools that read or edit
+   * points in place (e.g. reclassification). Positions are offsets from
+   * `coordinateOrigin` with Z in metres, before any display Z offset.
+   * `nodeRanges` gives each point a stable identity, `(key, index - start)`.
+   *
+   * @param id - Point cloud id
+   * @returns The data, or null when no such cloud is loaded
+   */
+  getPointCloudData(id: string): PointCloudData | null {
+    // A streamed cloud's buffers can be compacted before the manager receives
+    // the (debounced) update, so read it from the loader: its buffers and
+    // node ranges are always in step.
+    const loader = this._streamingLoaders.get(id) ?? this._eptStreamingLoaders.get(id);
+    if (loader) return loader.getLoadedPointCloudData();
+    return this._pointCloudManager?.getPointCloudData(id) ?? null;
+  }
+
+  /**
+   * Recolours all clouds from their current data. Call after editing point
+   * attributes in place through {@link getPointCloudData}.
+   */
+  refreshPointColors(): void {
+    this._pointCloudManager?.refreshColors();
+    // Edited classes may add or remove classification codes.
+    const available = new Set<number>();
+    for (const info of this._state.pointClouds) {
+      const data = this.getPointCloudData(info.id);
+      if (data) for (const code of getAvailableClassifications(data)) available.add(code);
+    }
+    this.setState({ availableClassifications: available });
+  }
+
+  /**
+   * The display settings that map a point's stored position to where it is
+   * drawn: the Z offset added to every point and the elevation filter.
+   *
+   * @returns The current Z offset (m) and elevation range (null when unfiltered)
+   */
+  getRenderSettings(): { zOffset: number; elevationRange: [number, number] | null } {
+    const options = this._pointCloudManager?.getOptions();
+    const range = options?.elevationRange;
+    return {
+      zOffset: options?.zOffset ?? 0,
+      elevationRange: range ? [range[0], range[1]] : null,
+    };
+  }
+
+  /**
+   * Pauses level-of-detail streaming for a COPC/EPT cloud: no new nodes are
+   * requested and none is evicted, so the loaded points (and their buffer
+   * indices) stay put. Requests already in flight still complete.
+   *
+   * @param id - Point cloud id
+   * @returns False when the cloud is not streamed
+   */
+  pauseStreaming(id: string): boolean {
+    const manager = this._viewportManagers.get(id);
+    if (!manager) return false;
+    manager.stop();
+    // Block queued node requests, and invalidate any viewport update (or its
+    // scheduled retry) still in flight, which could otherwise evict or reset.
+    this._streamingLoaders.get(id)?.setPaused(true);
+    this._eptStreamingLoaders.get(id)?.setPaused(true);
+    const requestIds = this._streamingLoaders.has(id)
+      ? this._copcViewportRequestIds
+      : this._eptViewportRequestIds;
+    requestIds.set(id, (requestIds.get(id) ?? 0) + 1);
+    return true;
+  }
+
+  /**
+   * Resumes level-of-detail streaming paused by {@link pauseStreaming} and
+   * immediately refreshes the loaded nodes for the current view.
+   *
+   * @param id - Point cloud id
+   */
+  resumeStreaming(id: string): void {
+    const manager = this._viewportManagers.get(id);
+    if (!manager) return;
+    const loader = this._streamingLoaders.get(id) ?? this._eptStreamingLoaders.get(id);
+    loader?.setPaused(false);
+    manager.start();
+    manager.forceUpdate();
+    void loader?.loadQueuedNodes();
+  }
+
+  /**
+   * Whether a streamed cloud still has node requests queued or in flight.
+   *
+   * @param id - Point cloud id
+   * @returns True while nodes are loading
+   */
+  isStreamingLoading(id: string): boolean {
+    const loader = this._streamingLoaders.get(id) ?? this._eptStreamingLoaders.get(id);
+    return loader?.isLoading() ?? false;
   }
 
   // ==================== LiDAR API ====================

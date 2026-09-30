@@ -1,6 +1,6 @@
 import { MapLibreOverlay } from '@deck.gl/maplibre';
 import type { Map as MapLibreMap } from 'maplibre-gl';
-import type { Layer } from '@deck.gl/core';
+import type { Layer, Viewport } from '@deck.gl/core';
 
 /** Marks the deck.gl canvas wrapper so a host can style or find it. */
 export const DECK_CANVAS_CLASS = 'maplibre-gl-lidar-canvas';
@@ -117,6 +117,20 @@ export class DeckOverlay {
   clearLayers(): void {
     this._layers.clear();
     this._updateOverlay();
+  }
+
+  /**
+   * The deck.gl viewport the overlay last rendered with, which matches what
+   * is on screen. Use it to project points to pixels (e.g. for selection).
+   *
+   * Reads MapLibreOverlay's private `_deck`; tests/point-editing-api.test.ts
+   * pins it against the installed @deck.gl/maplibre.
+   *
+   * @returns The viewport, or null before the first render
+   */
+  getViewport(): Viewport | null {
+    const deck = (this._overlay as unknown as { _deck?: { getViewports?: () => Viewport[] } })._deck;
+    return deck?.getViewports?.()[0] ?? null;
   }
 
   /**

@@ -15,7 +15,7 @@ import type {
   StreamingLoaderEvent,
   StreamingLoaderEventHandler,
 } from './streaming-types';
-import type { PointCloudData, ExtraPointAttributes, AttributeArray } from './types';
+import type { PointCloudData, ExtraPointAttributes, AttributeArray, PointNodeRange } from './types';
 import type { PointCloudBounds } from '../core/types';
 
 /**
@@ -259,6 +259,7 @@ export class CopcStreamingLoader {
   // Loading state
   private _loadingQueue: CachedNode[] = [];
   private _activeRequests: number = 0;
+  private _paused = false;
   private _totalLoadedPoints: number = 0;
   private _totalLoadedNodes: number = 0;
   private _isInitialized: boolean = false;
@@ -734,9 +735,27 @@ export class CopcStreamingLoader {
   }
 
   /**
+   * Pauses or resumes node dispatch. While paused no queued node is
+   * requested, so the loaded points stay put; requests already in flight
+   * still complete. Resuming does not drain the queue by itself; call
+   * {@link loadQueuedNodes}.
+   *
+   * @param paused - Whether to pause
+   */
+  setPaused(paused: boolean): void {
+    this._paused = paused;
+  }
+
+  /** Whether node dispatch is paused by {@link setPaused}. */
+  isPaused(): boolean {
+    return this._paused;
+  }
+
+  /**
    * Loads nodes from the queue, respecting point budget and concurrency limits.
    */
   async loadQueuedNodes(): Promise<void> {
+    if (this._paused) return;
     while (
       this._loadingQueue.length > 0 &&
       this._activeRequests < this._options.maxConcurrentRequests &&
@@ -784,6 +803,8 @@ export class CopcStreamingLoader {
    * @returns True if eviction completed, or false if active requests are still writing buffers
    */
   evictLoadedNodesOutsideViewport(viewport: ViewportInfo): boolean {
+    // Evicting compacts the buffers, which a paused caller relies on not happening.
+    if (this._paused) return false;
     if (this._activeRequests > 0) return false;
 
     const loadedNodes = Array.from(this._nodeCache.values())
@@ -1059,6 +1080,23 @@ export class CopcStreamingLoader {
   }
 
   /**
+   * The buffer range of every fully loaded node, ascending by start index.
+   * Ranges move when eviction compacts the buffers, so read them afresh with
+   * each {@link getLoadedPointCloudData} rather than caching them.
+   *
+   * @returns One range per loaded node
+   */
+  getLoadedNodeRanges(): PointNodeRange[] {
+    const ranges: PointNodeRange[] = [];
+    for (const node of this._nodeCache.values()) {
+      if (node.state === 'loaded' && node.bufferStartIndex !== undefined) {
+        ranges.push({ key: node.key, start: node.bufferStartIndex, count: node.pointCount });
+      }
+    }
+    return ranges.sort((a, b) => a.start - b.start);
+  }
+
+  /**
    * Gets the current loaded point cloud data for rendering.
    *
    * @returns Current loaded data
@@ -1088,6 +1126,7 @@ export class CopcStreamingLoader {
       hasIntensity: true,
       hasClassification: true,
       wkt: this._copc?.wkt,
+      nodeRanges: this.getLoadedNodeRanges(),
     };
   }
 

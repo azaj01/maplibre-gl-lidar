@@ -16,7 +16,7 @@ import type {
   EptCachedNode,
   ParsedDimension,
 } from './ept-types';
-import type { PointCloudData, ExtraPointAttributes, AttributeArray } from './types';
+import type { PointCloudData, ExtraPointAttributes, AttributeArray, PointNodeRange } from './types';
 import type { PointCloudBounds } from '../core/types';
 
 /**
@@ -222,6 +222,8 @@ export class EptStreamingLoader {
   // Loading state
   private _loadingQueue: EptCachedNode[] = [];
   private _activeRequests: number = 0;
+  private _paused = false;
+  private _hasReservationGaps = false;
   private _totalLoadedPoints: number = 0;
   private _totalLoadedNodes: number = 0;
   private _isInitialized: boolean = false;
@@ -796,9 +798,28 @@ export class EptStreamingLoader {
   }
 
   /**
+   * Pauses or resumes node dispatch. While paused no queued node is
+   * requested, so the loaded points stay put; requests already in flight
+   * still complete. Resuming does not drain the queue by itself; call
+   * {@link loadQueuedNodes}.
+   *
+   * @param paused - Whether to pause
+   */
+  setPaused(paused: boolean): void {
+    this._paused = paused;
+    if (!paused) this._reclaimFailedReservations();
+  }
+
+  /** Whether node dispatch is paused by {@link setPaused}. */
+  isPaused(): boolean {
+    return this._paused;
+  }
+
+  /**
    * Loads nodes from the queue, respecting point budget and concurrency limits.
    */
   async loadQueuedNodes(): Promise<void> {
+    if (this._paused) return;
     while (
       this._loadingQueue.length > 0 &&
       this._activeRequests < this._options.maxConcurrentRequests &&
@@ -862,8 +883,15 @@ export class EptStreamingLoader {
 
       this._scheduleLayerUpdate();
     } catch (error) {
-      // Release the reserved buffer space on failure
-      this._totalLoadedPoints -= reservedPoints;
+      // Release the reserved space only when no later node has reserved after
+      // it: otherwise a later node could be handed an overlapping range. A gap
+      // left behind is reclaimed once no request is in flight
+      // (_reclaimFailedReservations).
+      if (node.bufferStartIndex !== undefined && node.bufferStartIndex + reservedPoints === this._totalLoadedPoints) {
+        this._totalLoadedPoints -= reservedPoints;
+      } else {
+        this._hasReservationGaps = true;
+      }
       node.bufferStartIndex = undefined;
 
       // Track retry count and set cooldown timestamp
@@ -888,8 +916,43 @@ export class EptStreamingLoader {
       }
     } finally {
       this._activeRequests--;
+      this._reclaimFailedReservations();
       this.loadQueuedNodes();
     }
+  }
+
+  /**
+   * Closes the gaps failed node requests left in the buffers by moving later
+   * nodes down, once no request is in flight (so no reservation can move under
+   * a writer). Skipped while paused, when callers rely on indices staying put.
+   *
+   * @returns True when the buffers were compacted
+   */
+  private _reclaimFailedReservations(): boolean {
+    if (!this._hasReservationGaps || this._activeRequests > 0 || this._paused) return false;
+    const loaded = [...this._nodeCache.values()]
+      .filter((node) => node.state === 'loaded' && node.bufferStartIndex !== undefined)
+      .sort((a, b) => a.bufferStartIndex! - b.bufferStartIndex!);
+    let next = 0;
+    for (const node of loaded) {
+      const from = node.bufferStartIndex!;
+      if (from !== next) {
+        const count = node.pointCount;
+        this._positions!.copyWithin(next * 3, from * 3, (from + count) * 3);
+        this._intensities!.copyWithin(next, from, from + count);
+        this._classifications!.copyWithin(next, from, from + count);
+        this._colors?.copyWithin(next * 4, from * 4, (from + count) * 4);
+        for (const arr of Object.values(this._extraAttributes)) {
+          arr.copyWithin(next, from, from + count);
+        }
+        node.bufferStartIndex = next;
+      }
+      next += node.pointCount;
+    }
+    this._totalLoadedPoints = next;
+    this._hasReservationGaps = false;
+    this._scheduleLayerUpdate();
+    return true;
   }
 
   /**
@@ -1151,6 +1214,23 @@ export class EptStreamingLoader {
   }
 
   /**
+   * The buffer range of every fully loaded node, ascending by start index.
+   * Ranges move when eviction compacts the buffers, so read them afresh with
+   * each {@link getLoadedPointCloudData} rather than caching them.
+   *
+   * @returns One range per loaded node
+   */
+  getLoadedNodeRanges(): PointNodeRange[] {
+    const ranges: PointNodeRange[] = [];
+    for (const node of this._nodeCache.values()) {
+      if (node.state === 'loaded' && node.bufferStartIndex !== undefined) {
+        ranges.push({ key: node.key, start: node.bufferStartIndex, count: node.pointCount });
+      }
+    }
+    return ranges.sort((a, b) => a.start - b.start);
+  }
+
+  /**
    * Gets the current loaded point cloud data for rendering.
    *
    * @returns Current loaded data
@@ -1180,6 +1260,7 @@ export class EptStreamingLoader {
       hasIntensity: this._hasIntensity,
       hasClassification: true,
       wkt: this._metadata?.srs?.wkt,
+      nodeRanges: this.getLoadedNodeRanges(),
     };
   }
 
